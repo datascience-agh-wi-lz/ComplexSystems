@@ -1,7 +1,8 @@
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
 from scipy.special import gamma
-
+from tqdm import tqdm
 """
 Create Your Own Smoothed-Particle-Hydrodynamics Simulation (With Python)
 Philip Mocz (2020) Princeton Univeristy, @PMocz
@@ -24,7 +25,77 @@ def W( x, y, z, h ):
 	w = (1.0 / (h*np.sqrt(np.pi)))**3 * np.exp( -r**2 / h**2)
 	
 	return w
-	
+
+
+def cubicSplineKernel(x, y, z, h):
+    """
+    Cubic Spline Kernel (3D)
+    x, y, z : numpy arrays representing positions in 3D space
+    h       : smoothing length (scalar)
+    
+    Returns:
+        The cubic spline kernel evaluated at the input positions.
+    """
+    # Compute distance `r` in 3D space
+    r = np.sqrt(x**2 + y**2 + z**2)  # Vector length
+    
+    # Normalized distance `q`
+    q = r / h
+    
+    # Preallocate kernel array with zeros
+    w = np.zeros_like(r)
+    
+    # Cubic spline kernel weights
+    mask1 = (q >= 0) & (q < 1)
+    mask2 = (q >= 1) & (q < 2)
+    
+    w[mask1] = (1 / (np.pi * h**3)) * (1 - 1.5 * q[mask1]**2 + 0.75 * q[mask1]**3)
+    w[mask2] = (1 / (np.pi * h**3)) * (0.25 * (2 - q[mask2])**3)
+    
+    # Outside the kernel's support radius, `w` remains zero
+    return w
+
+def cubicSplineKernelGrad(dx, dy, dz, h):
+    """
+    Gradient of the Cubic Spline Kernel (3D)
+    dx, dy, dz : numpy arrays representing the differences in x, y, z coordinates
+    h          : smoothing length (scalar)
+    
+    Returns:
+        Gradients of the kernel in x, y, and z directions.
+    """
+    # Compute distance `r` in 3D space
+    r = np.sqrt(dx**2 + dy**2 + dz**2)  # Vector length
+    
+    # Normalized distance `q`
+    q = r / h
+    
+    # Preallocate gradient arrays with zeros
+    dWx = np.zeros_like(dx)
+    dWy = np.zeros_like(dy)
+    dWz = np.zeros_like(dz)
+    
+    # Avoid division by zero for zero distances
+    r_safe = np.where(r == 0, np.finfo(float).eps, r)
+    
+    # Compute the gradients for q < 1
+    mask1 = (q >= 0) & (q < 1)
+    coeff1 = (-3 * q[mask1] + 2.25 * q[mask1]**2) * (-1 / (np.pi * h**4))
+    dWx[mask1] = coeff1 * (dx[mask1] / r_safe[mask1])
+    dWy[mask1] = coeff1 * (dy[mask1] / r_safe[mask1])
+    dWz[mask1] = coeff1 * (dz[mask1] / r_safe[mask1])
+    
+    # Compute the gradients for 1 <= q < 2
+    mask2 = (q >= 1) & (q < 2)
+    coeff2 = (-0.75 * (2 - q[mask2])**2) * (-1 / (np.pi * h**4))
+    dWx[mask2] = coeff2 * (dx[mask2] / r_safe[mask2])
+    dWy[mask2] = coeff2 * (dy[mask2] / r_safe[mask2])
+    dWz[mask2] = coeff2 * (dz[mask2] / r_safe[mask2])
+    
+    # Gradients outside the kernel's support radius remain zero
+    return dWx, dWy, dWz
+
+ 
 	
 def gradW( x, y, z, h ):
 	"""
@@ -75,7 +146,7 @@ def getPairwiseSeparations( ri, rj ):
 	return dx, dy, dz
 	
 
-def getDensity( r, pos, m, h ):
+def getDensity( r, pos, m, h , spline_kernel=False):
 	"""
 	Get Density at sampling loctions from SPH particle distribution
 	r     is an M x 3 matrix of sampling locations
@@ -89,7 +160,10 @@ def getDensity( r, pos, m, h ):
 	
 	dx, dy, dz = getPairwiseSeparations( r, pos );
 	
-	rho = np.sum( m * W(dx, dy, dz, h), 1 ).reshape((M,1))
+	if spline_kernel:
+		rho = np.sum( m * cubicSplineKernel(dx, dy, dz, h), 1 ).reshape((M,1))
+	else:
+		rho = np.sum( m * W(dx, dy, dz, h), 1 ).reshape((M,1))
 	
 	return rho
 	
@@ -108,7 +182,7 @@ def getPressure(rho, k, n):
 	return P
 	
 
-def getAcc( pos, vel, m, h, k, n, lmbda, nu ):
+def getAcc( pos, vel, m, h, k, n, lmbda, nu, spline_kernel=False ):
 	"""
 	Calculate the acceleration on each SPH particle
 	pos   is an N x 3 matrix of positions
@@ -125,14 +199,18 @@ def getAcc( pos, vel, m, h, k, n, lmbda, nu ):
 	N = pos.shape[0]
 	
 	# Calculate densities at the position of the particles
-	rho = getDensity( pos, pos, m, h )
+	rho = getDensity( pos, pos, m, h, spline_kernel )
 	
 	# Get the pressures
 	P = getPressure(rho, k, n)
 	
 	# Get pairwise distances and gradients
 	dx, dy, dz = getPairwiseSeparations( pos, pos )
-	dWx, dWy, dWz = gradW( dx, dy, dz, h )
+ 
+	if spline_kernel:
+		dWx, dWy, dWz = cubicSplineKernelGrad( dx, dy, dz, h )
+	else:
+		dWx, dWy, dWz = gradW( dx, dy, dz, h )
 	
 	# Add Pressure contribution to accelerations
 	ax = - np.sum( m * ( P/rho**2 + P.T/rho.T**2  ) * dWx, 1).reshape((N,1))
@@ -152,111 +230,84 @@ def getAcc( pos, vel, m, h, k, n, lmbda, nu ):
 	
 import os
 from tqdm import tqdm
-
-def simulate(N=400, h=0.1, nu=1):
-	""" SPH simulation """
-	save_folder = os.path.join("lab4",f'sph{N}_{h}_{nu}')
-	os.makedirs(save_folder, exist_ok=True)
-	# Simulation parameters
-	t         = 0      # current time of the simulation
-	tEnd      = 12     # time at which simulation ends
-	dt        = 0.04   # timestep
-	M         = 2      # star mass
-	R         = 0.75   # star radius
-	k         = 0.1    # equation of state constant
-	n         = 1      # polytropic index
-	plotRealTime = True # switch on for plotting as the simulation goes along
-	
-	# Generate Initial Conditions
-	np.random.seed(42)            # set the random number generator seed
-	
-	lmbda = 2*k*(1+n)*np.pi**(-3/(2*n)) * (M*gamma(5/2+n)/R**3/gamma(1+n))**(1/n) / R**2  # ~ 2.01
-	m     = M/N                    # single particle mass
-	pos   = np.random.randn(N,3)   # randomly selected positions and velocities
-	vel   = np.zeros(pos.shape)
-	
-	# calculate initial gravitational accelerations
-	acc = getAcc( pos, vel, m, h, k, n, lmbda, nu )
-	
-	# number of timesteps
-	Nt = int(np.ceil(tEnd/dt))
-	
-	# prep figure
-	fig = plt.figure(figsize=(4,5), dpi=80)
-	grid = plt.GridSpec(3, 1, wspace=0.0, hspace=0.3)
-	ax1 = plt.subplot(grid[0:2,0])
-	ax2 = plt.subplot(grid[2,0])
-	rr = np.zeros((100,3))
-	rlin = np.linspace(0,1,100)
-	rr[:,0] =rlin
-	rho_analytic = lmbda/(4*k) * (R**2 - rlin**2)
-	
-	# Simulation Main Loop
-	
-	for i in tqdm(range(Nt)):
-		# (1/2) kick
-		vel += acc * dt/2
-		
-		# drift
-		pos += vel * dt
-		
-		# update accelerations
-		acc = getAcc( pos, vel, m, h, k, n, lmbda, nu )
-		
-		# (1/2) kick
-		vel += acc * dt/2
-		
-		# update time
-		t += dt
-		
-		# get density for plotting
-		rho = getDensity( pos, pos, m, h )
-		
-  
-		# plot in real time
-		if plotRealTime or (i == Nt-1):
-			plt.sca(ax1)
-			plt.cla()
-			cval = np.minimum((rho-3)/3,1).flatten()
-			plt.scatter(pos[:,0],pos[:,1], c=cval, cmap=plt.cm.autumn, s=10, alpha=0.5)
-			ax1.set(xlim=(-1.4, 1.4), ylim=(-1.2, 1.2))
-			ax1.set_aspect('equal', 'box')
-			ax1.set_xticks([-1,0,1])
-			ax1.set_yticks([-1,0,1])
-			ax1.set_facecolor('black')
-			ax1.set_facecolor((.1,.1,.1))
-			
-			plt.sca(ax2)
-			plt.cla()
-			ax2.set(xlim=(0, 1), ylim=(0, 3))
-			ax2.set_aspect(0.1)
-			plt.plot(rlin, rho_analytic, color='gray', linewidth=2)
-			rho_radial = getDensity( rr, pos, m, h )
-			plt.plot(rlin, rho_radial, color='blue')
-			plt.savefig(f'{save_folder}/{i}.png', dpi=240)
-			plt.pause(0.001)
-   	
-	
-	# add labels/legend
-	plt.sca(ax2)
-	plt.xlabel('radius')
-	plt.ylabel('density')
-	
-	# Save figure
-	plt.savefig(os.path.join("lab4",'sph.png'),dpi=240)
-	plt.show()
-	    
-	return 0
-	
-
-
-  
-if __name__== "__main__":
-    simulate(400, 0.1, 1)
-    simulate(100, 0.1, 1)
-    simulate(800, 0.1, 1)
-    simulate(400, 0.7, 1)
-    simulate(400, 0.001, 1)
-    simulate(400, 0.1, 5)
-    simulate(400, 0.1, 0.1)
+def simulate(N=400, h=0.1, nu=1, spline_kernel=False, split_star=False):
+    """ SPH simulation with animation """
+    # Simulation parameters
+    t = 0      # current time of the simulation
+    tEnd = 10  # time at which simulation ends
+    dt = 0.07  # timestep
+    M = 2      # star mass
+    R = 0.75   # star radius
+    k = 0.1    # equation of state constant
+    n = 1      # polytropic index
     
+    # Generate Initial Conditions
+    np.random.seed(42)
+    lmbda = 2 * k * (1 + n) * np.pi**(-3 / (2 * n)) * (M * gamma(5 / 2 + n) / R**3 / gamma(1 + n))**(1 / n) / R**2
+    m = M / N
+    pos = np.random.randn(N, 3)
+    vel = np.zeros(pos.shape)
+    if split_star:
+        pos[:N // 2, 0] -= 1
+        pos[N // 2:, 0] += 1
+        vel[N // 2:, 1] = 1
+        vel[:N // 2, 1] = -1
+    acc = getAcc(pos, vel, m, h, k, n, lmbda, nu, spline_kernel)
+    Nt = int(np.ceil(tEnd / dt))
+    
+    # For Animation
+    frames = []  # Store frames as (positions, density)
+    rlin = np.linspace(0, 1, 100)
+    rr = np.zeros((100, 3))
+    rr[:, 0] = rlin
+    rho_analytic = lmbda / (4 * k) * (R**2 - rlin**2)
+
+    # Simulation Main Loop
+    for i in tqdm(range(Nt)):
+        vel += acc * dt / 2
+        pos += vel * dt
+        acc = getAcc(pos, vel, m, h, k, n, lmbda, nu, spline_kernel)
+        vel += acc * dt / 2
+        t += dt
+        
+        rho = getDensity(pos, pos, m, h, spline_kernel)
+        rho_radial = getDensity(rr, pos, m, h, spline_kernel)
+        frames.append((pos.copy(), rho.flatten(), rho_radial.flatten()))
+    
+    # Plot and save animation
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(4, 6))
+    ax1.set_xlim(-1.4, 1.4)
+    ax1.set_ylim(-1.2, 1.2)
+    ax2.set_xlim(0, 1)
+    ax2.set_ylim(0, 3)
+    
+    scatter = ax1.scatter([], [], c=[], cmap='autumn', s=10, alpha=0.5)
+    line_analytic, = ax2.plot(rlin, rho_analytic, color='gray', linewidth=2)
+    line_sim, = ax2.plot([], [], color='blue')
+    
+    def update(frame):
+        pos, rho, rho_radial = frame
+        scatter.set_offsets(pos[:, :2])
+        scatter.set_array(np.minimum((rho - 3) / 3, 1))
+        line_sim.set_data(rlin, rho_radial)
+        return scatter, line_sim
+    
+    anim = FuncAnimation(fig, update, frames=frames, blit=True)
+    anim.save(os.path.join(f"sph{N}_{h}_{nu}_{spline_kernel}_{split_star}.gif"), writer='pillow', fps=15)    
+    return 0
+
+if __name__ == "__main__":
+    simulate(400, 0.1, 1, False)
+    
+    simulate(100, 0.1, 1, False)
+    simulate(800, 0.1, 1, False)
+    
+    simulate(400, 3, 1, False)
+    simulate(400, 0.001, 1, False)
+    
+    simulate(400, 0.1, 8, False)
+    simulate(400, 0.1, 0.1, False)
+    
+    simulate(400, 0.1, 1, True)
+    simulate(400, 0.1, 1, True, True)
+    simulate(400, 0.1, 1, False, True)
